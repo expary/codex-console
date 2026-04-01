@@ -2,6 +2,7 @@
 OAuth 客户端模块 - 处理 Codex OAuth 登录流程
 """
 
+import json
 import time
 import secrets
 from urllib.parse import urlparse, parse_qs
@@ -27,6 +28,17 @@ from .sentinel_token import build_sentinel_token
 
 class OAuthClient:
     """OAuth 客户端 - 用于获取 Access Token 和 Refresh Token"""
+
+    @staticmethod
+    def _normalize_oauth_issuer(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return "https://auth.openai.com"
+
+        parsed = urlparse(raw)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        return raw.rstrip("/")
     
     def __init__(self, config, proxy=None, verbose=True, browser_mode="protocol"):
         """
@@ -39,7 +51,9 @@ class OAuthClient:
             browser_mode: protocol | headless | headed
         """
         self.config = dict(config or {})
-        self.oauth_issuer = self.config.get("oauth_issuer", "https://auth.openai.com")
+        self.oauth_issuer = self._normalize_oauth_issuer(
+            self.config.get("oauth_issuer", "https://auth.openai.com")
+        )
         self.oauth_client_id = self.config.get("oauth_client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
         self.oauth_redirect_uri = self.config.get("oauth_redirect_uri", "http://localhost:1455/auth/callback")
         self.proxy = proxy
@@ -61,6 +75,136 @@ class OAuthClient:
         self.last_error = str(message or "").strip()
         if self.last_error:
             self._log(self.last_error)
+
+    def _has_chatgpt_session(self) -> bool:
+        """当前会话里是否已经有 ChatGPT next-auth 会话。"""
+        try:
+            for cookie in self.session.cookies:
+                name = cookie.name if hasattr(cookie, "name") else str(cookie)
+                domain = str(getattr(cookie, "domain", "") or "")
+                if name.startswith("__Secure-next-auth.session-token") and "chatgpt.com" in domain:
+                    return True
+                if name.startswith("_Secure-next-auth.session-token") and "chatgpt.com" in domain:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _prime_auth_session_from_chatgpt(self, user_agent=None, sec_ch_ua=None, impersonate=None):
+        """
+        利用当前已存在的 ChatGPT 登录态，先走一次 signin/openai，
+        尝试把 auth.openai.com 的登录态桥接出来，避免再次触发邮箱 OTP。
+        """
+        if not self._has_chatgpt_session():
+            return ""
+
+        self._log("检测到现有 ChatGPT 会话，先尝试桥接 auth 域登录态...")
+        csrf_token = ""
+        try:
+            csrf_url = "https://chatgpt.com/api/auth/csrf"
+            kwargs = {
+                "headers": self._headers(
+                    csrf_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept="application/json",
+                    referer="https://chatgpt.com/auth/login",
+                    origin="https://chatgpt.com",
+                    fetch_site="same-origin",
+                ),
+                "timeout": 20,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+
+            self._browser_pause(0.1, 0.22)
+            resp = self.session.get(csrf_url, **kwargs)
+            if resp.status_code == 200:
+                csrf_token = str((resp.json() or {}).get("csrfToken") or "").strip()
+        except Exception as e:
+            self._log(f"signin/openai 桥接前 csrf 获取异常: {e}")
+
+        if not csrf_token:
+            self._log("signin/openai 桥接未拿到 csrf，跳过")
+            return ""
+
+        auth_url = ""
+        try:
+            signin_url = "https://chatgpt.com/api/auth/signin/openai"
+            kwargs = {
+                "headers": self._headers(
+                    signin_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept="application/json",
+                    referer="https://chatgpt.com/auth/login",
+                    origin="https://chatgpt.com",
+                    content_type="application/x-www-form-urlencoded",
+                    fetch_site="same-origin",
+                ),
+                "data": {
+                    "callbackUrl": "https://chatgpt.com/",
+                    "csrfToken": csrf_token,
+                    "json": "true",
+                },
+                "timeout": 20,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+
+            self._browser_pause(0.1, 0.22)
+            resp = self.session.post(signin_url, **kwargs)
+            if resp.status_code == 200:
+                auth_url = str((resp.json() or {}).get("url") or "").strip()
+        except Exception as e:
+            self._log(f"signin/openai 桥接异常: {e}")
+
+        if not auth_url:
+            self._log("signin/openai 桥接未返回 auth_url")
+            return ""
+
+        current_url = auth_url
+        final_url = auth_url
+        for idx in range(12):
+            try:
+                kwargs = {
+                    "headers": self._headers(
+                        current_url,
+                        user_agent=user_agent,
+                        sec_ch_ua=sec_ch_ua,
+                        accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        referer="https://chatgpt.com/",
+                        navigation=True,
+                    ),
+                    "timeout": 25,
+                    "allow_redirects": False,
+                }
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
+
+                self._browser_pause(0.1, 0.24)
+                resp = self.session.get(current_url, **kwargs)
+                final_url = str(resp.url or current_url)
+                self._log(f"signin/openai 桥接重定向 {idx + 1}/12: {final_url[:120]}...")
+
+                if resp.status_code not in (301, 302, 303, 307, 308):
+                    break
+
+                location = normalize_flow_url(resp.headers.get("Location", ""), auth_base=self.oauth_issuer)
+                if not location:
+                    break
+                current_url = location
+                final_url = location
+            except Exception as e:
+                self._log(f"signin/openai 桥接重定向异常: {e}")
+                break
+
+        session_data = self._decode_oauth_session_cookie() or {}
+        if session_data.get("workspaces"):
+            self._log(f"signin/openai 桥接已拿到 auth session，workspace={len(session_data.get('workspaces') or [])}")
+        else:
+            self._log(f"signin/openai 桥接结束，但尚未拿到 workspace session，final={final_url[:120]}...")
+        return final_url
 
     def _browser_pause(self, low=0.15, high=0.4):
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
@@ -514,55 +658,64 @@ class OAuthClient:
         """提交密码，获取下一步状态。"""
         self._log("步骤3: POST /api/accounts/password/verify")
 
-        sentinel_pwd = build_sentinel_token(
-            self.session,
-            device_id,
-            flow="password_verify",
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-        )
-        if not sentinel_pwd:
-            self._set_error("无法获取 sentinel token (password_verify)")
-            return None
-
         request_url = f"{self.oauth_issuer}/api/accounts/password/verify"
-        headers = self._headers(
-            request_url,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            accept="application/json",
-            referer=referer or f"{self.oauth_issuer}/log-in/password",
-            origin=self.oauth_issuer,
-            content_type="application/json",
-            fetch_site="same-origin",
-            extra_headers={
-                "oai-device-id": device_id,
-                "openai-sentinel-token": sentinel_pwd,
-            },
-        )
-        headers.update(generate_datadog_trace())
+        max_attempts = 3
 
-        try:
-            kwargs = {"json": {"password": password}, "headers": headers, "timeout": 30, "allow_redirects": False}
-            if impersonate:
-                kwargs["impersonate"] = impersonate
+        for attempt in range(1, max_attempts + 1):
+            headers = self._headers(
+                request_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=referer or f"{self.oauth_issuer}/log-in/password",
+                origin=self.oauth_issuer,
+                content_type="application/json",
+                fetch_site="same-origin",
+            )
+            headers.update(generate_datadog_trace())
 
-            self._browser_pause()
-            r = self.session.post(request_url, **kwargs)
-            self._log(f"/password/verify -> {r.status_code}")
+            try:
+                kwargs = {"data": json.dumps({"password": password}), "headers": headers, "timeout": 30}
+                if impersonate:
+                    kwargs["impersonate"] = impersonate
 
-            if r.status_code != 200:
-                self._set_error(f"密码验证失败: {r.status_code} - {r.text[:180]}")
+                self._browser_pause()
+                r = self.session.post(request_url, **kwargs)
+                self._log(f"/password/verify -> {r.status_code}")
+
+                if r.status_code == 429 and attempt < max_attempts:
+                    wait_seconds = min(18, 5 * attempt)
+                    self._log(f"/password/verify 命中 429（第 {attempt}/{max_attempts} 次），{wait_seconds}s 后重试...")
+                    time.sleep(wait_seconds)
+                    continue
+
+                if r.status_code == 401 and attempt < max_attempts:
+                    body = str(r.text or "")
+                    if "invalid_username_or_password" in body or "Login failed" in body:
+                        wait_seconds = min(12, 3 * attempt)
+                        self._log(f"/password/verify 命中 401（第 {attempt}/{max_attempts} 次），{wait_seconds}s 后重试...")
+                        time.sleep(wait_seconds)
+                        continue
+
+                if r.status_code != 200:
+                    self._set_error(f"密码验证失败: {r.status_code} - {r.text[:180]}")
+                    return None
+
+                data = r.json()
+                flow_state = self._state_from_payload(data, current_url=str(r.url) or request_url)
+                self._log(f"verify {describe_flow_state(flow_state)}")
+                return flow_state
+            except Exception as e:
+                if attempt < max_attempts:
+                    wait_seconds = min(6, 2 * attempt)
+                    self._log(f"/password/verify 异常（第 {attempt}/{max_attempts} 次）: {e}，{wait_seconds}s 后重试...")
+                    time.sleep(wait_seconds)
+                    continue
+                self._set_error(f"密码验证异常: {e}")
                 return None
 
-            data = r.json()
-            flow_state = self._state_from_payload(data, current_url=str(r.url) or request_url)
-            self._log(f"verify {describe_flow_state(flow_state)}")
-            return flow_state
-        except Exception as e:
-            self._set_error(f"密码验证异常: {e}")
-            return None
+        self._set_error("密码验证失败: 超过最大重试次数")
+        return None
     
     def login_and_get_tokens(self, email, password, device_id, user_agent=None, sec_ch_ua=None, impersonate=None, skymail_client=None):
         """
@@ -598,6 +751,13 @@ class OAuthClient:
 
         seed_oai_device_cookie(self.session, device_id)
 
+        if self._has_chatgpt_session():
+            self._prime_auth_session_from_chatgpt(
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+
         self._log("步骤1: Bootstrap OAuth session...")
         authorize_final_url = self._bootstrap_oauth_session(
             authorize_url,
@@ -617,20 +777,46 @@ class OAuthClient:
             else f"{self.oauth_issuer}/log-in"
         )
 
-        state = self._submit_authorize_continue(
-            email,
-            device_id,
-            continue_referer,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-            authorize_url=authorize_url,
-            authorize_params=authorize_params,
-        )
-        if not state:
-            if not self.last_error:
-                self._set_error("提交邮箱后未进入有效的 OAuth 状态")
-            return None
+        bootstrap_state = self._state_from_url(authorize_final_url or authorize_url)
+        bootstrap_code = self._extract_code_from_state(bootstrap_state)
+        if bootstrap_code:
+            self._log(f"Bootstrap 已获取到 authorization code: {bootstrap_code[:20]}...")
+            self._log("步骤7: POST /oauth/token")
+            tokens = self._exchange_code_for_tokens(bootstrap_code, code_verifier, user_agent, impersonate)
+            if tokens:
+                self._log("✅ OAuth 登录成功")
+            else:
+                self._log("换取 tokens 失败")
+            return tokens
+
+        state = None
+        if bootstrap_state.page_type in {
+            "login_password",
+            "email_otp_verification",
+            "add_phone",
+            "consent",
+            "workspace_selection",
+            "organization_selection",
+        }:
+            state = bootstrap_state
+            self._log(f"Bootstrap 已进入可处理状态: {describe_flow_state(state)}")
+
+        if state is None:
+            state = self._submit_authorize_continue(
+                email,
+                device_id,
+                continue_referer,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+                authorize_url=authorize_url,
+                authorize_params=authorize_params,
+                screen_hint="login",
+            )
+            if not state:
+                if not self.last_error:
+                    self._set_error("提交邮箱后未进入有效的 OAuth 状态")
+                return None
 
         self._log(f"OAuth 状态起点: {describe_flow_state(state)}")
         seen_states = {}
@@ -1512,6 +1698,42 @@ class OAuthClient:
         tried_codes = set(getattr(skymail_client, "_used_codes", set()))
         otp_deadline = time.time() + 60
         otp_sent_at = time.time()
+        resend_count = 0
+        max_resends = 2
+
+        def _extract_error_detail(resp):
+            try:
+                payload = resp.json() or {}
+            except Exception:
+                payload = {}
+            err = payload.get("error") or {}
+            return (
+                str(err.get("code") or "").strip().lower(),
+                str(err.get("message") or "").strip(),
+            )
+
+        def _trigger_fresh_otp(reason: str) -> bool:
+            nonlocal otp_deadline, otp_sent_at, resend_count
+            if resend_count >= max_resends:
+                self._set_error(f"OAuth OTP 挑战已失效，且重发次数已耗尽: {reason}")
+                return False
+
+            resend_count += 1
+            self._log(f"当前 OTP 挑战已失效（{reason}），尝试重发新验证码 {resend_count}/{max_resends} ...")
+            send_ok, send_detail = self._send_email_otp(
+                device_id,
+                user_agent,
+                sec_ch_ua,
+                impersonate,
+                referer=state.current_url or state.continue_url or f"{self.oauth_issuer}/email-verification",
+            )
+            if not send_ok:
+                self._set_error(send_detail or "email-otp/send 失败")
+                return False
+
+            otp_deadline = time.time() + 60
+            otp_sent_at = time.time()
+            return True
 
         def validate_otp(code):
             tried_codes.add(code)
@@ -1535,7 +1757,12 @@ class OAuthClient:
 
             self._log(f"/email-otp/validate -> {resp_otp.status_code}")
             if resp_otp.status_code != 200:
+                error_code, error_message = _extract_error_detail(resp_otp)
                 self._log(f"OTP 无效: {resp_otp.text[:160]}")
+                if error_code == "max_check_attempts" or "too many failed attempts" in error_message.lower():
+                    return "resend"
+                if error_code in {"expired_email_otp_code", "email_otp_expired"}:
+                    return "resend"
                 return None
 
             try:
@@ -1579,6 +1806,10 @@ class OAuthClient:
                     continue
 
                 next_state = validate_otp(code)
+                if next_state == "resend":
+                    if not _trigger_fresh_otp("max_check_attempts"):
+                        break
+                    continue
                 if next_state:
                     return next_state
                 if self.last_error:
@@ -1602,6 +1833,11 @@ class OAuthClient:
 
                 for otp_code in candidate_codes:
                     next_state = validate_otp(otp_code)
+                    if next_state == "resend":
+                        if not _trigger_fresh_otp("max_check_attempts"):
+                            break
+                        next_state = None
+                        continue
                     if next_state:
                         return next_state
 

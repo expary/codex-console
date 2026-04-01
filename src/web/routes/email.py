@@ -71,7 +71,7 @@ class ServiceTestResult(BaseModel):
 
 class OutlookBatchImportRequest(BaseModel):
     """Outlook 批量导入请求"""
-    data: str  # 多行数据，每行格式: 邮箱----密码 或 邮箱----密码----client_id----refresh_token
+    data: str  # 多行数据，每行格式: 邮箱----密码 或 邮箱----密码----refresh_token----client_id
     enabled: bool = True
     priority: int = 0
 
@@ -570,7 +570,7 @@ async def batch_import_outlook(request: OutlookBatchImportRequest):
 
     支持两种格式：
     - 格式一（密码认证）：邮箱----密码
-    - 格式二（XOAUTH2 认证）：邮箱----密码----client_id----refresh_token
+    - 格式二（XOAUTH2 认证）：邮箱----密码----refresh_token----client_id
 
     每行一个账户，使用四个连字符（----）分隔字段
     """
@@ -625,8 +625,8 @@ async def batch_import_outlook(request: OutlookBatchImportRequest):
 
             # 检查是否有 OAuth 信息（格式二）
             if len(parts) >= 4:
-                client_id = parts[2].strip()
-                refresh_token = parts[3].strip()
+                refresh_token = parts[2].strip()
+                client_id = parts[3].strip()
                 if client_id and refresh_token:
                     config["client_id"] = client_id
                     config["refresh_token"] = refresh_token

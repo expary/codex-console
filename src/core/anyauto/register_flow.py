@@ -21,12 +21,19 @@ from ...config.settings import get_settings
 class EmailServiceAdapter:
     """将 codex-console 邮箱服务适配成 any-auto-register 预期接口。"""
 
-    def __init__(self, email_service, email: str, email_id: Optional[str], log_fn: Callable[[str], None]):
+    def __init__(
+        self,
+        email_service,
+        email: str,
+        email_id: Optional[str],
+        log_fn: Callable[[str], None],
+        initial_used_codes: Optional[set[str]] = None,
+    ):
         self.es = email_service
         self.email = email
         self.email_id = email_id
         self.log_fn = log_fn or (lambda _msg: None)
-        self._used_codes: set[str] = set()
+        self._used_codes: set[str] = set(initial_used_codes or set())
 
     def wait_for_verification_code(self, email, timeout=60, otp_sent_at=None, exclude_codes=None):
         exclude = set(exclude_codes or [])
@@ -76,6 +83,7 @@ class AnyAutoRegistrationEngine:
         self.password: Optional[str] = None
         self.session = None
         self.device_id: Optional[str] = None
+        self.otp_blacklist: set[str] = set()
 
     def _log(self, message: str):
         if self.callback_logger:
@@ -210,22 +218,34 @@ class AnyAutoRegistrationEngine:
                     time.sleep(1)
 
                 # 1. 创建邮箱
-                self.email_info = self.email_service.create_email()
-                raw_email = str((self.email_info or {}).get("email") or "").strip()
-                if not raw_email:
-                    last_error = "创建邮箱失败"
-                    return {"success": False, "error_message": last_error}
+                raw_email = str((self.email_info or {}).get("email") or self.inbox_email or self.email or "").strip()
+                if raw_email:
+                    normalized_email = raw_email.lower()
+                    self.inbox_email = raw_email
+                    self.email = normalized_email
+                    try:
+                        if self.email_info is not None:
+                            self.email_info["email"] = normalized_email
+                    except Exception:
+                        pass
+                    self._log(f"复用现有邮箱: {normalized_email}")
+                else:
+                    self.email_info = self.email_service.create_email()
+                    raw_email = str((self.email_info or {}).get("email") or "").strip()
+                    if not raw_email:
+                        last_error = "创建邮箱失败"
+                        return {"success": False, "error_message": last_error}
 
-                normalized_email = raw_email.lower()
-                self.inbox_email = raw_email
-                self.email = normalized_email
-                try:
-                    self.email_info["email"] = normalized_email
-                except Exception:
-                    pass
+                    normalized_email = raw_email.lower()
+                    self.inbox_email = raw_email
+                    self.email = normalized_email
+                    try:
+                        self.email_info["email"] = normalized_email
+                    except Exception:
+                        pass
 
-                if raw_email != normalized_email:
-                    self._log(f"邮箱规范化: {raw_email} -> {normalized_email}")
+                    if raw_email != normalized_email:
+                        self._log(f"邮箱规范化: {raw_email} -> {normalized_email}")
 
                 # 2. 生成密码 & 用户信息
                 self.password = self.password or self._build_password(password_len)
@@ -236,7 +256,14 @@ class AnyAutoRegistrationEngine:
 
                 # 3. 邮箱适配器
                 email_id = (self.email_info or {}).get("service_id")
-                skymail_adapter = EmailServiceAdapter(self.email_service, normalized_email, email_id, self._log)
+                skymail_adapter = EmailServiceAdapter(
+                    self.email_service,
+                    normalized_email,
+                    email_id,
+                    self._log,
+                    initial_used_codes=self.otp_blacklist,
+                )
+                self.otp_blacklist = skymail_adapter._used_codes
 
                 # 4. 注册状态机
                 chatgpt_client = ChatGPTClient(
@@ -270,6 +297,7 @@ class AnyAutoRegistrationEngine:
                 # 保存会话与设备
                 self.session = chatgpt_client.session
                 self.device_id = chatgpt_client.device_id
+                session_result_cache: Dict[str, Any] = {}
 
                 if add_phone_required:
                     pwdless = self._passwordless_oauth_reauth(
@@ -298,8 +326,7 @@ class AnyAutoRegistrationEngine:
                     if not account_id:
                         account_id = self._extract_account_id_from_token(session_result.get("access_token", ""))
                     workspace_id = str(session_result.get("workspace_id", "") or "").strip() or account_id
-                    return {
-                        "success": True,
+                    session_result_cache = {
                         "access_token": session_result.get("access_token", ""),
                         "session_token": session_result.get("session_token", ""),
                         "account_id": account_id,
@@ -312,9 +339,13 @@ class AnyAutoRegistrationEngine:
                             "account": session_result.get("account") or {},
                         },
                     }
+                    self._log("复用会话已拿到 access/session，继续尝试 OAuth 回退补全 refresh_token...")
 
                 # 6. OAuth 回退
-                self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
+                if session_result_cache:
+                    self._log("复用会话已拿到 access/session，回退到 OAuth 登录补全 refresh_token...")
+                else:
+                    self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
                 tokens = None
                 oauth_client = None
                 for oauth_attempt in range(2):
@@ -329,7 +360,11 @@ class AnyAutoRegistrationEngine:
                         browser_mode=self.browser_mode,
                     )
                     oauth_client._log = self._log
-                    oauth_client.session = chatgpt_client.session
+                    if session_result_cache and oauth_attempt == 0:
+                        oauth_client.session = chatgpt_client.session
+                        self._log("优先沿用刚注册完成的认证态推进 OAuth；若失败则切到全新会话重登")
+                    elif session_result_cache:
+                        self._log("切换为全新 OAuth 会话重新登录，避免注册态 Cookie 干扰密码校验")
 
                     tokens = oauth_client.login_and_get_tokens(
                         normalized_email,
@@ -372,12 +407,13 @@ class AnyAutoRegistrationEngine:
                     account_id = self._extract_account_id_from_token(tokens.get("access_token", "")) or workspace_id
                     return {
                         "success": True,
-                        "access_token": tokens.get("access_token", ""),
+                        "access_token": tokens.get("access_token", "") or session_result_cache.get("access_token", ""),
                         "refresh_token": tokens.get("refresh_token", ""),
                         "id_token": tokens.get("id_token", ""),
-                        "account_id": account_id or ("v2_acct_" + chatgpt_client.device_id[:8]),
-                        "workspace_id": workspace_id or account_id,
-                        "session_token": session_cookie,
+                        "account_id": account_id or session_result_cache.get("account_id", "") or ("v2_acct_" + chatgpt_client.device_id[:8]),
+                        "workspace_id": workspace_id or account_id or session_result_cache.get("workspace_id", ""),
+                        "session_token": session_cookie or session_result_cache.get("session_token", ""),
+                        "metadata": dict(session_result_cache.get("metadata") or {}),
                     }
 
                 # 7. 手机号验证需求：按成功返回，但标记为待补全

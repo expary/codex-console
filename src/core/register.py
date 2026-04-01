@@ -45,6 +45,7 @@ class RegistrationResult:
     success: bool
     email: str = ""
     password: str = ""  # 注册密码
+    client_id: str = ""
     account_id: str = ""
     workspace_id: str = ""
     access_token: str = ""
@@ -63,6 +64,7 @@ class RegistrationResult:
             "success": self.success,
             "email": self.email,
             "password": self.password,
+            "client_id": self.client_id,
             "account_id": self.account_id,
             "workspace_id": self.workspace_id,
             "access_token": self.access_token[:20] + "..." if self.access_token else "",
@@ -144,6 +146,7 @@ class RegistrationEngine:
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
         self._token_acquisition_requires_login: bool = False  # 新注册账号需要二次登录拿 token
+        self._create_user_account_succeeded: bool = False
         self._create_account_continue_url: Optional[str] = None  # create_account 返回的 continue_url（ABCard链路兜底）
         self._create_account_workspace_id: Optional[str] = None
         self._create_account_account_id: Optional[str] = None
@@ -154,6 +157,7 @@ class RegistrationEngine:
         self._last_otp_validation_code: Optional[str] = None
         self._last_otp_validation_status_code: Optional[int] = None
         self._last_otp_validation_outcome: str = ""  # success/http_non_200/network_timeout/network_error
+        self._otp_code_blacklist: set[str] = set()
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -774,6 +778,39 @@ class RegistrationEngine:
         self._log(f"{label}: Sentinel 点头放行，继续前进")
         return did, sen_token
 
+    def _get_oauth_authorize_fallback_url(self, log_prefix: str = "") -> str:
+        """获取一个尽量新鲜的 OAuth authorize URL，用于 continue_url 兜底。"""
+        previous_url = str(
+            (
+                getattr(self.oauth_start, "auth_url", "")
+                or getattr(self.oauth_start, "url", "")
+                if self.oauth_start
+                else ""
+            )
+            or ""
+        ).strip()
+
+        try:
+            if self._start_oauth():
+                refreshed_url = str(
+                    (
+                        getattr(self.oauth_start, "auth_url", "")
+                        or getattr(self.oauth_start, "url", "")
+                        if self.oauth_start
+                        else ""
+                    )
+                    or ""
+                ).strip()
+                if refreshed_url:
+                    self._log(f"{log_prefix}刷新 OAuth authorize URL 作为兜底 continue_url", "warning")
+                    return refreshed_url
+        except Exception as e:
+            self._log(f"{log_prefix}刷新 OAuth authorize URL 失败: {e}", "warning")
+
+        if previous_url:
+            self._log(f"{log_prefix}复用现有 OAuth authorize URL 作为兜底 continue_url", "warning")
+        return previous_url
+
     @staticmethod
     def _extract_session_token_from_cookie_text(cookie_text: str) -> str:
         """从 Cookie 文本中提取 next-auth session token（兼容分片）。"""
@@ -950,6 +987,31 @@ class RegistrationEngine:
         )
         return bool(result.session_token and result.access_token)
 
+    def _finalize_registration_token_pending(
+        self,
+        result: RegistrationResult,
+        workspace_id: str = "",
+        reason: str = "",
+    ) -> bool:
+        """新注册账号在 token 补取失败时，允许按“建号成功、token 待补”收尾。"""
+        if self._is_existing_account:
+            return False
+        if not (self._create_user_account_succeeded or self._create_account_account_id):
+            return False
+
+        if not result.account_id:
+            result.account_id = str(self._create_account_account_id or "").strip()
+        if not result.workspace_id:
+            result.workspace_id = str(workspace_id or self._create_account_workspace_id or "").strip()
+        if not result.refresh_token:
+            result.refresh_token = str(self._create_account_refresh_token or "").strip()
+        result.password = self.password or ""
+        result.source = "register"
+        result.device_id = result.device_id or str(self.device_id or "")
+        if reason:
+            self._log(reason, "warning")
+        return True
+
     def _bootstrap_chatgpt_signin_for_session(self, result: RegistrationResult) -> bool:
         """
         对齐 ABCard 的补会话路径：
@@ -1072,6 +1134,12 @@ class RegistrationEngine:
         login -> password -> email otp -> workspace -> auth/session。
         """
         try:
+            def _is_registration_gate_url(url: str) -> bool:
+                u = str(url or "").strip().lower()
+                if not u:
+                    return False
+                return ("auth.openai.com/about-you" in u) or ("auth.openai.com/add-phone" in u)
+
             if not self.email or not self.password:
                 self._log("会话桥接自动登录缺少邮箱或密码，无法继续", "warning")
                 return False
@@ -1132,33 +1200,74 @@ class RegistrationEngine:
                 self._log("会话桥接自动登录在 OTP 后已命中 session_token")
                 return True
 
-            workspace_id = self._get_workspace_id()
+            workspace_id = str(self._get_workspace_id() or "").strip()
             if not workspace_id:
                 workspace_id = str(result.workspace_id or "").strip()
                 if workspace_id:
                     self._log(f"会话桥接自动登录复用已知 workspace_id: {workspace_id}")
             if not workspace_id:
-                self._log("会话桥接自动登录未获取到 workspace_id", "warning")
-                return False
-            result.workspace_id = workspace_id
+                workspace_id = str(self._last_validate_otp_workspace_id or self._create_account_workspace_id or "").strip()
+                if workspace_id:
+                    self._log(f"会话桥接自动登录复用缓存 workspace_id: {workspace_id}", "warning")
 
-            continue_url = self._select_workspace(workspace_id)
+            continue_url = ""
+            otp_continue = str(self._last_validate_otp_continue_url or "").strip()
+            if otp_continue and _is_registration_gate_url(otp_continue):
+                self._log("会话桥接自动登录忽略 OTP 返回的注册门页 continue_url", "warning")
+                otp_continue = ""
+
+            cached_continue = str(self._create_account_continue_url or "").strip()
+            if cached_continue and _is_registration_gate_url(cached_continue):
+                self._log("会话桥接自动登录忽略 create_account 缓存的注册门页 continue_url", "warning")
+                cached_continue = ""
+
+            if workspace_id:
+                result.workspace_id = workspace_id
+                continue_url = str(self._select_workspace(workspace_id) or "").strip()
+                if continue_url and _is_registration_gate_url(continue_url):
+                    self._log("会话桥接自动登录忽略 workspace/select 返回的注册门页 continue_url", "warning")
+                    continue_url = ""
+                if not continue_url:
+                    self._log("会话桥接自动登录未获取到 continue_url，尝试 OAuth authorize 兜底", "warning")
+            if not workspace_id:
+                self._log("会话桥接自动登录未获取到 workspace_id，改用 continue_url 兜底", "warning")
+
             if not continue_url:
-                cached_continue = str(self._create_account_continue_url or "").strip()
-                if cached_continue:
-                    continue_url = cached_continue
-                    self._log("会话桥接自动登录未获取到 continue_url，改用 create_account 缓存 continue_url", "warning")
-                else:
-                    self._log("会话桥接自动登录未获取到 continue_url", "warning")
-                    return False
+                oauth_start_url = str(self._get_oauth_authorize_fallback_url("会话桥接自动登录") or "").strip()
+                if oauth_start_url:
+                    continue_url = oauth_start_url
+
+            if not continue_url and otp_continue:
+                continue_url = otp_continue
+                self._log("会话桥接自动登录使用 OTP 返回 continue_url 继续授权链路", "warning")
+
+            if not continue_url and cached_continue:
+                continue_url = cached_continue
+                self._log("会话桥接自动登录改用 create_account 缓存 continue_url", "warning")
+
+            if not continue_url:
+                self._log("会话桥接自动登录未获取到 continue_url", "warning")
+                self._warmup_chatgpt_session()
+                return self._capture_auth_session_tokens(result, access_hint=result.access_token)
 
             callback_url, final_url = self._follow_redirects(continue_url)
             self._log(
                 f"会话桥接自动登录重定向完成: callback={'有' if callback_url else '无'}, final={str(final_url or '')[:100]}..."
             )
 
+            if callback_url and ("error=" not in callback_url):
+                token_info = self._handle_oauth_callback(callback_url)
+                if token_info:
+                    result.account_id = str(token_info.get("account_id") or result.account_id or "").strip()
+                    result.access_token = str(token_info.get("access_token") or result.access_token or "").strip()
+                    result.refresh_token = str(token_info.get("refresh_token") or result.refresh_token or "").strip()
+                    result.id_token = str(token_info.get("id_token") or result.id_token or "").strip()
+
             self._warmup_chatgpt_session()
-            return self._capture_auth_session_tokens(result, access_hint=result.access_token)
+            captured = self._capture_auth_session_tokens(result, access_hint=result.access_token)
+            if not result.access_token:
+                self._capture_access_token_light(result)
+            return captured
         except Exception as e:
             self._log(f"会话桥接自动登录异常: {e}", "warning")
             return False
@@ -1456,18 +1565,9 @@ class RegistrationEngine:
                 self._log("workspace/select 未返回 continue_url，尝试 OAuth authorize 兜底", "warning")
 
         if not continue_url:
-            oauth_start_url = str(
-                (
-                    getattr(self.oauth_start, "auth_url", "")
-                    or getattr(self.oauth_start, "url", "")
-                    if self.oauth_start
-                    else ""
-                )
-                or ""
-            ).strip()
+            oauth_start_url = str(self._get_oauth_authorize_fallback_url("") or "").strip()
             if oauth_start_url:
                 continue_url = oauth_start_url
-                self._log("使用 OAuth authorize URL 作为兜底 continue_url", "warning")
 
         if not continue_url and otp_continue:
             continue_url = otp_continue
@@ -1486,6 +1586,8 @@ class RegistrationEngine:
         if not callback_url:
             self._log("未命中 OAuth 回调，尝试 auth/session 兜底抓取 token...", "warning")
             self._capture_auth_session_tokens(result, access_hint=result.access_token)
+            if not result.access_token:
+                self._capture_access_token_light(result)
             if not result.account_id:
                 result.account_id = str(self._create_account_account_id or "").strip()
             if not result.workspace_id:
@@ -1499,15 +1601,11 @@ class RegistrationEngine:
                 self._log("未命中 callback，已通过 auth/session 兜底拿到 Access Token，继续完成注册", "warning")
                 return True
 
-            # 对新注册账号放宽：账号已创建成功时允许“注册成功、token 待补”
-            if (not self._is_existing_account) and self._create_account_account_id:
-                result.account_id = result.account_id or str(self._create_account_account_id or "").strip()
-                result.workspace_id = result.workspace_id or str(workspace_id or self._create_account_workspace_id or "").strip()
-                result.refresh_token = result.refresh_token or str(self._create_account_refresh_token or "").strip()
-                result.password = self.password or ""
-                result.source = "register"
-                result.device_id = result.device_id or str(self.device_id or "")
-                self._log("回调链路未命中且未抓到 Access Token，但账号已创建成功；按注册成功收尾（token 待后续补齐）", "warning")
+            if self._finalize_registration_token_pending(
+                result,
+                workspace_id=workspace_id,
+                reason="回调链路未命中且未抓到 Access Token，但账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
                 return True
 
             result.error_message = "跟随重定向链失败"
@@ -1516,14 +1614,11 @@ class RegistrationEngine:
         self._log("处理 OAuth 回调，准备把 token 请出来...")
         token_info = self._handle_oauth_callback(callback_url)
         if not token_info:
-            if (not self._is_existing_account) and self._create_account_account_id:
-                result.account_id = result.account_id or str(self._create_account_account_id or "").strip()
-                result.workspace_id = result.workspace_id or str(workspace_id or self._create_account_workspace_id or "").strip()
-                result.refresh_token = result.refresh_token or str(self._create_account_refresh_token or "").strip()
-                result.password = self.password or ""
-                result.source = "register"
-                result.device_id = result.device_id or str(self.device_id or "")
-                self._log("OAuth 回调处理失败，但账号已创建成功；按注册成功收尾（token 待后续补齐）", "warning")
+            if self._finalize_registration_token_pending(
+                result,
+                workspace_id=workspace_id,
+                reason="OAuth 回调处理失败，但账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
                 return True
             result.error_message = "处理 OAuth 回调失败"
             return False
@@ -1551,6 +1646,12 @@ class RegistrationEngine:
         走「登录 OTP -> Workspace -> OAuth callback」主干，避免 ABCard/native 增强链路干扰。
         同时补齐“第二封验证码”重试链路，避免 Outlook 轮询卡死。
         """
+        def _is_registration_gate_url(url: str) -> bool:
+            u = str(url or "").strip().lower()
+            if not u:
+                return False
+            return ("auth.openai.com/about-you" in u) or ("auth.openai.com/add-phone" in u)
+
         self._log("等待登录验证码到场，最后这位嘉宾还在路上...")
         self._log("核对登录验证码，验明正身一下...")
         login_otp_tried_codes: set[str] = set()
@@ -1602,33 +1703,124 @@ class RegistrationEngine:
                 self._log(f"Workspace ID（缓存）: {workspace_id}", "warning")
 
         continue_url = ""
+        otp_continue = str(self._last_validate_otp_continue_url or "").strip()
+        if otp_continue and _is_registration_gate_url(otp_continue):
+            self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
+            otp_continue = ""
+
+        cached_continue = str(self._create_account_continue_url or "").strip()
+        if cached_continue and _is_registration_gate_url(cached_continue):
+            self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
+            cached_continue = ""
+
         if workspace_id:
             result.workspace_id = workspace_id
             self._log("选择 Workspace，安排个靠谱座位...")
             continue_url = str(self._select_workspace(workspace_id) or "").strip()
+            if continue_url and _is_registration_gate_url(continue_url):
+                self._log("workspace/select 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
+                continue_url = ""
             if not continue_url:
-                self._log("workspace/select 未返回 continue_url，尝试使用缓存 continue_url", "warning")
+                self._log("workspace/select 未返回 continue_url，尝试 OAuth authorize 兜底", "warning")
         else:
-            self._log("未获取到 Workspace ID，尝试直接使用缓存 continue_url", "warning")
+            self._log("未获取到 Workspace ID，优先尝试 OAuth authorize 兜底", "warning")
 
         if not continue_url:
-            continue_url = str(self._last_validate_otp_continue_url or self._create_account_continue_url or "").strip()
-            if continue_url:
-                self._log("使用缓存 continue_url 继续授权链路", "warning")
+            oauth_start_url = str(self._get_oauth_authorize_fallback_url("") or "").strip()
+            if oauth_start_url:
+                continue_url = oauth_start_url
+
+        if not continue_url and otp_continue:
+            continue_url = otp_continue
+            self._log("使用 OTP 返回 continue_url 继续授权链路", "warning")
+
+        if not continue_url and cached_continue:
+            continue_url = cached_continue
+            self._log("使用 create_account 缓存 continue_url 作为兜底", "warning")
 
         if not continue_url:
-            result.error_message = "获取 Workspace ID 失败"
+            result.error_message = "获取 continue_url 失败"
             return False
 
         self._log("顺着重定向面包屑往前走，别跟丢了...")
-        callback_url, _final_url = self._follow_redirects(continue_url)
+        callback_url, final_url = self._follow_redirects(continue_url)
         if not callback_url:
+            self._log(
+                f"Outlook 收尾未命中 OAuth 回调，final_url={str(final_url or '')[:120]}...",
+                "warning",
+            )
+            if "auth.openai.com/log-in" in str(final_url or "").lower():
+                fallback_enabled = bool(getattr(get_settings(), "registration_enable_anyauto_fallback", True))
+                if (not self._is_existing_account) and fallback_enabled:
+                    self._log(
+                        "授权链路回到了登录页；跳过主链路二次补登录，避免提前耗尽登录 OTP 配额，留给后续 anyauto fallback",
+                        "warning",
+                    )
+                else:
+                    self._log("授权链路回到了登录页，尝试自动补登录后继续抓取 token...", "warning")
+                    if self._bridge_login_for_session_token(result):
+                        if not result.account_id:
+                            result.account_id = str(self._create_account_account_id or "").strip()
+                        if not result.workspace_id:
+                            result.workspace_id = str(workspace_id or self._create_account_workspace_id or "").strip()
+                        if not result.refresh_token:
+                            result.refresh_token = str(self._create_account_refresh_token or "").strip()
+                        result.password = self.password or ""
+                        result.source = "login" if self._is_existing_account else "register"
+                        result.device_id = result.device_id or str(self.device_id or "")
+                        self._log("登录页补登录成功，已通过 auth/session 拿到 token，继续完成注册", "warning")
+                        return True
+
+            self._log("未命中 OAuth 回调，尝试 auth/session 兜底抓取 token...", "warning")
+            self._capture_auth_session_tokens(result, access_hint=result.access_token)
+            if not result.account_id:
+                result.account_id = str(self._create_account_account_id or "").strip()
+            if not result.workspace_id:
+                result.workspace_id = str(workspace_id or self._create_account_workspace_id or "").strip()
+            if not result.refresh_token:
+                result.refresh_token = str(self._create_account_refresh_token or "").strip()
+            if result.access_token:
+                result.password = self.password or ""
+                result.source = "login" if self._is_existing_account else "register"
+                result.device_id = result.device_id or str(self.device_id or "")
+                self._log("未命中 callback，已通过 auth/session 兜底拿到 Access Token，继续完成注册", "warning")
+                return True
+
+            if self._finalize_registration_token_pending(
+                result,
+                workspace_id=workspace_id,
+                reason="回调链路未命中且未抓到 Access Token，但账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
+                return True
+
             result.error_message = "跟随重定向链失败"
             return False
 
         self._log("处理 OAuth 回调，准备把 token 请出来...")
         token_info = self._handle_oauth_callback(callback_url)
         if not token_info:
+            self._log("OAuth 回调失败，尝试 auth/session 兜底抓取 token...", "warning")
+            self._capture_auth_session_tokens(result, access_hint=result.access_token)
+            if not result.access_token:
+                self._capture_access_token_light(result)
+            if not result.account_id:
+                result.account_id = str(self._create_account_account_id or "").strip()
+            if not result.workspace_id:
+                result.workspace_id = str(workspace_id or self._create_account_workspace_id or "").strip()
+            if not result.refresh_token:
+                result.refresh_token = str(self._create_account_refresh_token or "").strip()
+            if result.access_token:
+                result.password = self.password or ""
+                result.source = "login" if self._is_existing_account else "register"
+                result.device_id = result.device_id or str(self.device_id or "")
+                self._log("OAuth 回调失败，但 auth/session 已拿到 Access Token，继续完成注册", "warning")
+                return True
+            if self._finalize_registration_token_pending(
+                result,
+                workspace_id=workspace_id,
+                reason="OAuth 回调失败且未抓到 Access Token，但账号已创建成功；按注册成功收尾（token 待后续补齐）",
+            ):
+                return True
             result.error_message = "处理 OAuth 回调失败"
             return False
 
@@ -1858,9 +2050,9 @@ class RegistrationEngine:
         except Exception:
             return ""
 
-    def _ensure_native_required_tokens(self, result: RegistrationResult) -> bool:
+    def _ensure_upload_ready_tokens(self, result: RegistrationResult, stage_label: str = "上传") -> bool:
         """
-        原生注册入口要求拿齐：
+        校验账号是否已达到可上传到下游 API 的状态：
         Account ID / Workspace ID / Client ID / Access Token / Refresh Token
         """
         try:
@@ -1884,13 +2076,15 @@ class RegistrationEngine:
                 or getattr(self.oauth_manager, "client_id", "")
                 or ""
             ).strip()
+            if client_id and not result.client_id:
+                result.client_id = client_id
 
             missing = []
             if not result.account_id:
                 missing.append("Account ID")
             if not result.workspace_id:
                 missing.append("Workspace ID")
-            if not client_id:
+            if not result.client_id:
                 missing.append("Client ID")
             if not result.access_token:
                 missing.append("Access Token")
@@ -1898,18 +2092,23 @@ class RegistrationEngine:
                 missing.append("Refresh Token")
 
             if missing:
-                self._log(f"原生入口关键参数缺失: {', '.join(missing)}", "error")
+                self._log(f"{stage_label}所需关键参数缺失: {', '.join(missing)}", "error")
+                result.error_message = f"{stage_label}所需关键参数缺失: {', '.join(missing)}"
                 return False
 
             self._log(
-                "原生入口关键参数校验通过: "
+                f"{stage_label}所需关键参数校验通过: "
                 f"Account ID={result.account_id}, Workspace ID={result.workspace_id}, "
-                f"Client ID={client_id}, Access=有, Refresh=有"
+                f"Client ID={result.client_id}, Access=有, Refresh=有"
             )
             return True
         except Exception as e:
-            self._log(f"原生入口关键参数校验异常: {e}", "error")
+            self._log(f"{stage_label}关键参数校验异常: {e}", "error")
+            result.error_message = f"{stage_label}关键参数校验异常: {e}"
             return False
+
+    def _ensure_native_required_tokens(self, result: RegistrationResult) -> bool:
+        return self._ensure_upload_ready_tokens(result, stage_label="原生入口")
 
     def _restart_login_flow(self) -> Tuple[bool, str]:
         """新注册账号完成建号后，重新发起一次登录流程拿 token。"""
@@ -2316,7 +2515,11 @@ class RegistrationEngine:
 
             attempted_codes.add(code)
 
-            if self._validate_verification_code(code):
+            otp_ok = self._validate_verification_code(code)
+            if self._last_otp_validation_outcome in {"success", "http_non_200"}:
+                self._otp_code_blacklist.add(code)
+
+            if otp_ok:
                 return True
 
             if attempt < max_attempts:
@@ -2350,6 +2553,8 @@ class RegistrationEngine:
             if response.status_code != 200:
                 self._log(f"账户创建失败: {response.text[:200]}", "warning")
                 return False
+
+            self._create_user_account_succeeded = True
 
             try:
                 data = response.json() or {}
@@ -2459,14 +2664,51 @@ class RegistrationEngine:
                         if decoded == auth_info_text:
                             break
                         auth_info_text = decoded
-                    try:
-                        auth_info_json = json_module.loads(auth_info_text)
+                    auth_info_value = str(auth_info_text or "").strip()
+                    skip_warning_values = {"", "deleted", "undefined", "null", "none", "false", "true", "nan"}
+                    auth_info_candidates: List[str] = []
+                    seen_candidates = set()
+
+                    def _push_auth_info_candidate(value: str) -> None:
+                        normalized = str(value or "").strip()
+                        if not normalized or normalized in seen_candidates:
+                            return
+                        seen_candidates.add(normalized)
+                        auth_info_candidates.append(normalized)
+
+                    _push_auth_info_candidate(auth_info_value)
+                    if auth_info_value.startswith("j:"):
+                        _push_auth_info_candidate(auth_info_value[2:])
+                    if len(auth_info_value) >= 2 and auth_info_value[0] == auth_info_value[-1] and auth_info_value[0] in ("'", '"'):
+                        _push_auth_info_candidate(auth_info_value[1:-1])
+                    segments = auth_info_value.split(".")
+                    if len(segments) >= 2 and segments[1]:
+                        _push_auth_info_candidate(segments[1])
+
+                    auth_info_parse_failed = False
+                    for candidate in auth_info_candidates:
+                        auth_info_json = None
+                        lowered = candidate.lower()
+                        if lowered in skip_warning_values:
+                            continue
+                        try:
+                            auth_info_json = json_module.loads(candidate)
+                        except Exception:
+                            try:
+                                pad = "=" * ((4 - (len(candidate) % 4)) % 4)
+                                decoded = base64.urlsafe_b64decode((candidate + pad).encode("ascii"))
+                                auth_info_json = json_module.loads(decoded.decode("utf-8"))
+                            except Exception:
+                                auth_info_parse_failed = True
+                                auth_info_json = None
+
                         workspace_id = _extract_workspace_id(auth_info_json)
                         if workspace_id:
                             self._log(f"Workspace ID (auth-info): {workspace_id}")
                             return workspace_id
-                    except Exception as auth_info_err:
-                        self._log(f"解析 auth-info Cookie 失败: {auth_info_err}", "warning")
+
+                    if auth_info_parse_failed and auth_info_value.lower() not in skip_warning_values:
+                        self._log("auth-info Cookie 非 JSON/BASE64 JSON，跳过此兜底", "warning")
 
                 # 兜底：复用 create_account 缓存
                 cached_workspace = str(self._create_account_workspace_id or "").strip()
@@ -2675,6 +2917,7 @@ class RegistrationEngine:
         try:
             self._is_existing_account = False
             self._token_acquisition_requires_login = False
+            self._create_user_account_succeeded = False
             self._otp_sent_at = None
             self._create_account_continue_url = None
             self._create_account_workspace_id = None
@@ -2682,6 +2925,7 @@ class RegistrationEngine:
             self._create_account_refresh_token = None
             self._last_validate_otp_continue_url = None
             self._last_validate_otp_workspace_id = None
+            self._otp_code_blacklist = set()
 
             self._log("=" * 60)
             self._log("注册流程启动，开始替你敲门")
@@ -2776,21 +3020,33 @@ class RegistrationEngine:
                 if not self._complete_token_exchange(result, require_login_otp=not use_abcard_entry):
                     return result
 
+            if not self._ensure_upload_ready_tokens(result, stage_label="上传"):
+                self._log("当前账号尚未达到可上传到 sub2api/cilproxyapi 的状态，本次注册判定失败", "error")
+                return result
+
             # 10. 完成
+            settings = get_settings()
+            client_id = str(getattr(settings, "openai_client_id", "") or getattr(self.oauth_manager, "client_id", "") or "").strip()
+            result.client_id = client_id
             self._log("=" * 60)
+            session_pending = not bool(result.session_token)
             if self._is_existing_account:
                 self._log("登录成功，老朋友顺利回家")
+            elif session_pending:
+                self._log("注册成功，账号已达到可上传状态；仅 session_token 待补", "warning")
             else:
-                self._log("注册成功，账号已经稳稳落地，可以开香槟了")
+                self._log("注册成功，账号已达到可上传状态")
             self._log(f"邮箱: {result.email}")
             self._log(f"Device ID: {result.device_id or '-'}")
+            self._log(f"Client ID: {result.client_id or '-'}")
             self._log(f"Account ID: {result.account_id}")
             self._log(f"Workspace ID: {result.workspace_id}")
+            self._log(f"Access Token: {'有' if bool(result.access_token) else '无'}")
+            self._log(f"Refresh Token: {'有' if bool(result.refresh_token) else '无'}")
+            self._log(f"Session Token: {'有' if bool(result.session_token) else '无'}")
             self._log("=" * 60)
 
             result.success = True
-            settings = get_settings()
-            client_id = str(getattr(settings, "openai_client_id", "") or getattr(self.oauth_manager, "client_id", "") or "").strip()
             result.metadata = {
                 "email_service": self.email_service.service_type.value,
                 "proxy_used": self.proxy_url,
@@ -2804,8 +3060,11 @@ class RegistrationEngine:
                 "has_refresh_token": bool(result.refresh_token),
                 "registration_entry_flow": configured_entry_flow,
                 "registration_entry_flow_effective": effective_entry_flow,
-                # 对齐 K:\1\2：原生入口允许无 session_token 成功，但会标记待补。
-                "session_token_pending": (effective_entry_flow == "native") and (not bool(result.session_token)),
+                "upload_ready": True,
+                "token_pending": session_pending,
+                "session_token_pending": session_pending,
+                "access_token_pending": (not bool(result.access_token)),
+                "refresh_token_pending": (not bool(result.refresh_token)),
             }
 
             return result
@@ -2865,6 +3124,7 @@ class RegistrationEngine:
             or getattr(self.oauth_manager, "client_id", "")
             or ""
         ).strip()
+        result.client_id = client_id
         metadata = dict(flow_result.get("metadata") or {})
         metadata.update(
             {
@@ -2900,6 +3160,13 @@ class RegistrationEngine:
             browser_mode=browser_mode or "protocol",
             extra_config=None,
         )
+        flow_engine.email_info = self.email_info
+        flow_engine.email = self.email
+        flow_engine.inbox_email = self.inbox_email
+        flow_engine.password = self.password
+        flow_engine.session = self.session
+        flow_engine.device_id = self.device_id
+        flow_engine.otp_blacklist = set(self._otp_code_blacklist)
         flow_result = flow_engine.run()
 
         self.email_info = flow_engine.email_info
@@ -2908,6 +3175,7 @@ class RegistrationEngine:
         self.password = flow_engine.password
         self.session = flow_engine.session
         self.device_id = flow_engine.device_id
+        self._otp_code_blacklist.update(set(getattr(flow_engine, "otp_blacklist", set()) or set()))
 
         fallback_result = self._build_anyauto_fallback_result(flow_result, primary_error=primary_error)
         if fallback_result.session_token:
@@ -2968,6 +3236,10 @@ class RegistrationEngine:
         self._log("主注册链路未成功，开始尝试 PR60 anyauto V2 回退流程...", "warning")
         fallback_result = self._run_anyauto_fallback(primary_error=primary_error)
         if fallback_result.success:
+            if not self._ensure_upload_ready_tokens(fallback_result, stage_label="上传"):
+                fallback_result.success = False
+                self._log("PR60 anyauto V2 已返回成功，但仍未达到可上传状态，本次仍判定失败", "warning")
+                return fallback_result
             self._log("PR60 anyauto V2 回退流程成功，已补上 V2 注册兜底能力")
             return fallback_result
 
@@ -2993,8 +3265,19 @@ class RegistrationEngine:
             return False
 
         try:
+            if not self._ensure_upload_ready_tokens(result, stage_label="上传"):
+                self._log("保存前校验失败：账号尚未达到可上传状态，拒绝写库", "error")
+                return False
+
             # 获取默认 client_id
             settings = get_settings()
+            client_id = str(
+                result.client_id
+                or (result.metadata or {}).get("client_id")
+                or getattr(settings, "openai_client_id", "")
+                or getattr(self.oauth_manager, "client_id", "")
+                or ""
+            ).strip()
 
             with get_db() as db:
                 # 保存账户信息
@@ -3002,7 +3285,7 @@ class RegistrationEngine:
                     db,
                     email=result.email,
                     password=result.password,
-                    client_id=settings.openai_client_id,
+                    client_id=client_id,
                     session_token=result.session_token,
                     cookies=self._dump_session_cookies(),
                     email_service=self.email_service.service_type.value,
